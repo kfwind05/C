@@ -1,9 +1,11 @@
-from flask import Flask, jsonify, request, render_template, session, redirect, url_for
+from flask import Flask, jsonify, request, render_template, session, redirect, url_for, flash
 from urllib.parse import urlparse, urljoin, urlencode
 from functools import wraps
 import json
 import os
 import re
+import secrets
+import tempfile
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -17,7 +19,7 @@ app = Flask(
     template_folder=os.path.join(APP_DIR, 'templates'),
     static_folder=os.path.join(APP_DIR, 'static'),
 )
-app.secret_key = 'your-secret-key-here'
+app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 # 管理者認証情報
 ADMIN_CREDENTIALS = {
@@ -82,6 +84,7 @@ WARNING_CODES = {
 # サンプルデータの読み込み
 DATA_FILE = os.path.join(APP_DIR, 'data', 'shelters.json')
 INSTRUCTIONS_FILE = os.path.join(APP_DIR, 'data', 'instructions.json')
+ANNOUNCEMENTS_FILE = os.path.join(APP_DIR, 'data', 'announcements.json')
 
 def load_json(path, default):
     """JSONファイルを読み込む（存在しない・壊れている場合は default を返す）"""
@@ -93,20 +96,123 @@ def load_json(path, default):
 
 shelters = load_json(DATA_FILE, [])
 instructions = load_json(INSTRUCTIONS_FILE, [])
+announcements = load_json(ANNOUNCEMENTS_FILE, [])
 
-def save_instructions():
-    """指示ボードのデータをファイルに保存する"""
+
+def save_json_file(path, data):
+    """JSONを一時ファイル経由で置換し、失敗を呼び出し元へ伝える"""
+    temporary_path = None
     try:
-        with open(INSTRUCTIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(instructions, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        with tempfile.NamedTemporaryFile(
+            'w', encoding='utf-8', dir=os.path.dirname(path), delete=False
+        ) as file:
+            temporary_path = file.name
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def save_instructions(records=None):
+    save_json_file(INSTRUCTIONS_FILE, instructions if records is None else records)
 
 
 def save_shelters():
     """避難所データをファイルに保存する"""
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(shelters, f, ensure_ascii=False, indent=2)
+
+
+BOARD_TARGETS = ('住民', '防災課', '道路管理課')
+BOARD_DISTRICTS = ('市内全域', '青森地区', '浪岡地区')
+BOARD_URGENCIES = ('高', '中', '低')
+BOARD_STATUSES = ('未対応', '対応中', '完了')
+URGENCY_ORDER = {'高': 0, '中': 1, '低': 2}
+
+
+def board_district_options():
+    return list(dict.fromkeys((*BOARD_DISTRICTS, *shelter_districts())))
+
+
+def board_shelter_options():
+    return list(dict.fromkeys(
+        shelter.get('name', '').strip()
+        for shelter in shelters
+        if isinstance(shelter, dict)
+        and isinstance(shelter.get('name'), str)
+        and shelter.get('name', '').strip()
+    ))
+
+
+def board_csrf_token():
+    if 'board_csrf_token' not in session:
+        session['board_csrf_token'] = secrets.token_urlsafe(32)
+    return session['board_csrf_token']
+
+
+def board_csrf_valid():
+    submitted = request.form.get('csrf_token', '')
+    expected = session.get('board_csrf_token', '')
+    return bool(expected and secrets.compare_digest(submitted, expected))
+
+
+def board_timestamp():
+    return datetime.now(JST).isoformat(timespec='seconds')
+
+
+def board_timestamp_order(value):
+    if not isinstance(value, str):
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=JST)
+        return parsed.timestamp()
+    except ValueError:
+        match = re.fullmatch(r'(\d{4})年(\d{2})月(\d{2})日 (\d{2}):(\d{2})', value)
+        if match:
+            return datetime(*map(int, match.groups()), tzinfo=JST).timestamp()
+        return 0
+
+
+def format_board_timestamp(value):
+    if not isinstance(value, str):
+        return '不明'
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(JST)
+        return parsed.strftime('%Y年%m月%d日 %H:%M')
+    except ValueError:
+        return value
+
+
+app.jinja_env.filters['board_time'] = format_board_timestamp
+
+
+def canonical_instruction_status(value):
+    return value if value in BOARD_STATUSES else '未対応'
+
+
+app.jinja_env.globals['canonical_instruction_status'] = canonical_instruction_status
+
+
+def validate_announcement(data):
+    errors = []
+    if data['district'] not in board_district_options():
+        errors.append('対象地区を選択してください。')
+    if data['urgency'] not in BOARD_URGENCIES:
+        errors.append('緊急度の指定が正しくありません。')
+    if not data['content']:
+        errors.append('発信内容を入力してください。')
+    if not data['easy_content']:
+        errors.append('やさしい日本語での発信内容を入力してください。')
+    if data['shelter'] and data['shelter'] not in board_shelter_options():
+        errors.append('選択された避難先は登録されていません。')
+    return errors
 # ────────────────────────────────
 
 # ────────────────────────────────
@@ -130,6 +236,9 @@ def login_required(f):
 def get_japan_time():
     """日本時間（JST）の現在時刻を取得する"""
     return datetime.now(JST).strftime("%Y年%m月%d日 %H:%M")
+
+
+app.jinja_env.globals['get_japan_time'] = get_japan_time
 
 
 def format_report_time(iso_str):
@@ -426,7 +535,16 @@ def get_weather_warnings():
 @app.route('/')
 def index():
     resident_notices = [i for i in instructions if i.get('target') == '住民']
-    return render_template('index.html', resident_notices=resident_notices)
+    latest_announcements = sorted(
+        (item for item in announcements if isinstance(item, dict)),
+        key=lambda item: (board_timestamp_order(item.get('published_at')), item.get('id', 0)),
+        reverse=True
+    )
+    return render_template(
+        'index.html',
+        resident_notices=resident_notices,
+        announcements=latest_announcements
+    )
 
 # ログインページ
 @app.route('/login', methods=['GET', 'POST'])
@@ -689,12 +807,212 @@ def edit_shelter(shelter_id):
     )
 
 
-# 指示ボード：住民向けの指示を一覧で確認する
-@app.route('/board')
+# 指示・発信ボード
+@app.route('/board', methods=['GET', 'POST'])
 @login_required
 def board():
-    resident_instructions = [i for i in instructions if i.get('target') == '住民']
-    return render_template('board.html', instructions=resident_instructions)
+    district_options = board_district_options()
+    shelter_options = board_shelter_options()
+    sort_order = request.values.get('sort', 'newest')
+    if sort_order not in ('newest', 'urgency'):
+        sort_order = 'newest'
+
+    form_data = session.pop('instruction_form', None) or {
+        'target': '住民',
+        'district': '市内全域',
+        'urgency': '中',
+        'content': '',
+        'shelter': '',
+    }
+    announcement_data = session.pop('announcement_form', None) or {
+        'district': '市内全域',
+        'urgency': '中',
+        'content': '',
+        'easy_content': '',
+        'shelter': '',
+    }
+    announcement_history = sorted(
+        (item for item in announcements if isinstance(item, dict)),
+        key=lambda item: (board_timestamp_order(item.get('published_at')), item.get('id', 0)),
+        reverse=True
+    )
+    errors = []
+
+    if request.method == 'POST':
+        if not board_csrf_valid():
+            return 'リクエストを確認できませんでした。ページを再読み込みしてください。', 400
+
+        action = request.form.get('action', '')
+        if action == 'register':
+            form_data = {
+                'target': request.form.get('target', '').strip(),
+                'district': request.form.get('district', '').strip(),
+                'urgency': request.form.get('urgency', '').strip(),
+                'content': request.form.get('content', '').strip(),
+                'shelter': request.form.get('shelter', '').strip(),
+            }
+            if form_data['target'] not in BOARD_TARGETS:
+                errors.append('宛先を選択してください。')
+            if form_data['district'] not in district_options:
+                errors.append('対象地区を選択してください。')
+            if form_data['urgency'] not in BOARD_URGENCIES:
+                errors.append('緊急度の指定が正しくありません。')
+            if not form_data['content']:
+                errors.append('指示内容を入力してください。')
+            if form_data['shelter'] and form_data['shelter'] not in shelter_options:
+                errors.append('選択された避難先は登録されていません。')
+
+            if not errors:
+                next_id = max(
+                    (item.get('id', 0) for item in instructions
+                     if isinstance(item, dict) and isinstance(item.get('id'), int)),
+                    default=0
+                ) + 1
+                now = board_timestamp()
+                record = {
+                    'id': next_id,
+                    **form_data,
+                    'status': '未対応',
+                    'created_at': now,
+                    'updated_at': now,
+                }
+                candidate = [*instructions, record]
+                try:
+                    save_instructions(candidate)
+                except OSError:
+                    errors.append('指示を保存できませんでした。入力内容を保ったまま再度お試しください。')
+                    session['instruction_form'] = form_data
+                    return render_template(
+                        'board.html', instructions=instructions, form_data=form_data,
+                        announcement_data=announcement_data, announcements=announcement_history, errors=errors,
+                        district_options=district_options, shelter_options=shelter_options,
+                        targets=BOARD_TARGETS, urgencies=BOARD_URGENCIES,
+                        statuses=BOARD_STATUSES, sort_order=sort_order,
+                        csrf_token=board_csrf_token()
+                    ), 500
+                instructions[:] = candidate
+                flash('指示を登録しました。', 'success')
+                return redirect(url_for('board', sort=sort_order))
+
+        elif action == 'update_status':
+            instruction_id = request.form.get('instruction_id', '')
+            status = request.form.get('status', '')
+            if not instruction_id.isdigit() or status not in BOARD_STATUSES:
+                flash('状態の指定が正しくありません。', 'error')
+                return redirect(url_for('board', sort=sort_order))
+            candidate = [dict(item) if isinstance(item, dict) else item for item in instructions]
+            record = next(
+                (item for item in candidate if isinstance(item, dict)
+                 and str(item.get('id')) == instruction_id),
+                None
+            )
+            if record is None:
+                flash('更新する指示が見つかりません。', 'error')
+                return redirect(url_for('board', sort=sort_order))
+            record['status'] = status
+            record['updated_at'] = board_timestamp()
+            try:
+                save_instructions(candidate)
+            except OSError:
+                flash('状態を保存できませんでした。時間をおいて再度お試しください。', 'error')
+            else:
+                instructions[:] = candidate
+                flash('対応状況を更新しました。', 'success')
+            return redirect(url_for('board', sort=sort_order))
+
+        elif action == 'review_announcement':
+            announcement_data = {
+                'district': request.form.get('district', '').strip(),
+                'urgency': request.form.get('urgency', '').strip(),
+                'content': request.form.get('content', '').strip(),
+                'easy_content': request.form.get('easy_content', '').strip(),
+                'shelter': request.form.get('shelter', '').strip(),
+            }
+            errors = validate_announcement(announcement_data)
+            if not errors:
+                session['pending_announcement'] = announcement_data
+                return redirect(url_for('confirm_announcement'))
+        else:
+            return '操作の指定が正しくありません。', 400
+
+    ordered_instructions = [item for item in instructions if isinstance(item, dict)]
+    if sort_order == 'urgency':
+        ordered_instructions.sort(
+            key=lambda item: (
+                URGENCY_ORDER.get(item.get('urgency'), 3),
+                -board_timestamp_order(item.get('created_at')),
+                -int(item.get('id', 0)) if str(item.get('id', 0)).isdigit() else 0,
+            )
+        )
+    else:
+        ordered_instructions.sort(
+            key=lambda item: (
+                board_timestamp_order(item.get('created_at')),
+                int(item.get('id', 0)) if str(item.get('id', 0)).isdigit() else 0,
+            ),
+            reverse=True
+        )
+    return render_template(
+        'board.html', instructions=ordered_instructions, form_data=form_data,
+        announcement_data=announcement_data, announcements=announcement_history, errors=errors,
+        district_options=district_options, shelter_options=shelter_options,
+        targets=BOARD_TARGETS, urgencies=BOARD_URGENCIES,
+        statuses=BOARD_STATUSES, sort_order=sort_order,
+        csrf_token=board_csrf_token()
+    ), (400 if errors else 200)
+
+
+@app.route('/board/confirm', methods=['GET', 'POST'])
+@login_required
+def confirm_announcement():
+    draft = session.get('pending_announcement')
+    if not isinstance(draft, dict):
+        flash('確認する発信内容がありません。', 'error')
+        return redirect(url_for('board'))
+
+    errors = []
+    if request.method == 'POST':
+        if not board_csrf_valid():
+            return 'リクエストを確認できませんでした。ページを再読み込みしてください。', 400
+        action = request.form.get('action', '')
+        if action == 'back':
+            session['announcement_form'] = draft
+            session.pop('pending_announcement', None)
+            return redirect(url_for('board'))
+        if action != 'publish':
+            return '操作の指定が正しくありません。', 400
+
+        errors = validate_announcement(draft)
+        if errors:
+            return render_template(
+                'board_confirm.html', draft=draft, errors=errors,
+                csrf_token=board_csrf_token()
+            ), 400
+
+        next_id = max(
+            (item.get('id', 0) for item in announcements
+             if isinstance(item, dict) and isinstance(item.get('id'), int)),
+            default=0
+        ) + 1
+        record = {'id': next_id, **draft, 'published_at': board_timestamp()}
+        candidate = [record, *announcements]
+        try:
+            save_json_file(ANNOUNCEMENTS_FILE, candidate)
+        except OSError:
+            return render_template(
+                'board_confirm.html', draft=draft,
+                errors=['お知らせを保存できませんでした。発信は完了していません。再度お試しください。'],
+                csrf_token=board_csrf_token()
+            ), 500
+        announcements[:] = candidate
+        session.pop('pending_announcement', None)
+        flash('お知らせを発信しました。', 'success')
+        return redirect(url_for('board'))
+
+    return render_template(
+        'board_confirm.html', draft=draft, errors=errors,
+        csrf_token=board_csrf_token()
+    )
 
 # 検索結果ページ：templates/search_results.html を返す
 @app.route('/search_results')
